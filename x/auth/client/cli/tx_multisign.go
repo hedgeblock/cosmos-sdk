@@ -11,8 +11,10 @@ import (
 	"github.com/cosmos/cosmos-sdk/client"
 	"github.com/cosmos/cosmos-sdk/client/flags"
 	"github.com/cosmos/cosmos-sdk/client/tx"
+	"github.com/cosmos/cosmos-sdk/codec"
 	"github.com/cosmos/cosmos-sdk/crypto/keyring"
 	kmultisig "github.com/cosmos/cosmos-sdk/crypto/keys/multisig"
+	cryptotypes "github.com/cosmos/cosmos-sdk/crypto/types"
 	"github.com/cosmos/cosmos-sdk/crypto/types/multisig"
 	sdk "github.com/cosmos/cosmos-sdk/types"
 	"github.com/cosmos/cosmos-sdk/types/errors"
@@ -120,6 +122,45 @@ func makeMultiSignCmd() func(cmd *cobra.Command, args []string) (err error) {
 			txFactory = txFactory.WithAccountNumber(accnum).WithSequence(seq)
 		}
 
+		sigVerifiableTx := parsedTx.(signing.SigVerifiableTx)
+		oldSigs, _ := sigVerifiableTx.GetSignaturesV2()
+		txPubKeys, _ := sigVerifiableTx.GetPubKeys()
+		signModeHandler := txCfg.SignModeHandler()
+
+		extractedSignatues := make([]signingtypes.SignatureV2, 0)
+
+		for _, sig := range oldSigs {
+			extractedSigs := extractSignatues(sig, txPubKeys, clientCtx.LegacyAmino, func(pk cryptotypes.PubKey, signatureData signingtypes.SignatureData) error {
+				signingData := signing.SignerData{
+					Address:       sdk.AccAddress(pk.Address()).String(),
+					ChainID:       txFactory.ChainID(),
+					AccountNumber: txFactory.AccountNumber(),
+					Sequence:      txFactory.Sequence(),
+					PubKey:        pk,
+				}
+
+				singleSignatureData, ok := signatureData.(*signingtypes.SingleSignatureData)
+				// TODO - Implemenation required for multisignatureData case
+				if !ok {
+					return fmt.Errorf("nested multisignature is not supported yet")
+				}
+				msg, _ := signModeHandler.GetSignBytes(singleSignatureData.SignMode, signingData, txBuilder.GetTx())
+
+				valid := pk.VerifySignature(msg, singleSignatureData.Signature)
+				if !valid {
+					return fmt.Errorf("signature doesn't match with the given public key")
+				}
+				return nil
+			})
+
+			// Add All extracted signatures into signature slice
+			extractedSignatues = append(extractedSignatues, extractedSigs...)
+		}
+
+		for _, sig := range extractedSignatues {
+			multisig.AddSignatureV2(multisigSig, sig, multisigPub.GetPubKeys())
+		}
+
 		// read each signature and add it to the multisig if valid
 		for i := 2; i < len(args); i++ {
 			sigs, err := unmarshalSignatureJSON(clientCtx, args[i])
@@ -140,7 +181,7 @@ func makeMultiSignCmd() func(cmd *cobra.Command, args []string) (err error) {
 					PubKey:        sig.PubKey,
 				}
 
-				err = signing.VerifySignature(sig.PubKey, signingData, sig.Data, txCfg.SignModeHandler(), txBuilder.GetTx())
+				err = signing.VerifySignature(sig.PubKey, signingData, sig.Data, signModeHandler, txBuilder.GetTx())
 				if err != nil {
 					addr, _ := sdk.AccAddressFromHexUnsafe(sig.PubKey.Address().String())
 					return fmt.Errorf("couldn't verify signature for address %s", addr)
@@ -417,4 +458,56 @@ func getMultisigRecord(clientCtx client.Context, name string) (*keyring.Record, 
 	}
 
 	return multisigRecord, nil
+}
+
+type SignatureVerifier func(cryptotypes.PubKey, signingtypes.SignatureData) error
+
+func matchPubKeyAndSignature(signatureData signingtypes.SignatureData, keys []cryptotypes.PubKey, verificationHandler SignatureVerifier) cryptotypes.PubKey {
+	for _, key := range keys {
+		multiPubkey, ok := key.(*kmultisig.LegacyAminoPubKey)
+		if ok {
+			return matchPubKeyAndSignature(signatureData, multiPubkey.GetPubKeys(), verificationHandler)
+		}
+		err := verificationHandler(key, signatureData)
+		if err == nil {
+			return key
+		}
+	}
+	return nil
+}
+
+func extractSignatues(oldSig signingtypes.SignatureV2, pubKeys []cryptotypes.PubKey, cdc *codec.LegacyAmino,
+	verificationHandler SignatureVerifier) []signingtypes.SignatureV2 {
+
+	extractedSignatues := make([]signingtypes.SignatureV2, 0)
+
+	switch data := oldSig.Data.(type) {
+
+	case *signingtypes.SingleSignatureData:
+		return append(extractedSignatues, oldSig)
+
+	case *signingtypes.MultiSignatureData:
+		for _, sig := range data.Signatures {
+			// TODO - convert this into switch case to handle nested multisig
+			singleSig, ok := sig.(*signingtypes.SingleSignatureData)
+			if !ok {
+				continue
+			}
+
+			pub := matchPubKeyAndSignature(singleSig, pubKeys, verificationHandler)
+			if pub != nil {
+				// TODO - find replacement for this deprecated method
+				stdSig := legacytx.StdSignature{
+					PubKey:    pub,
+					Signature: singleSig.Signature,
+				}
+
+				sigV2, err := legacytx.StdSignatureToSignatureV2(cdc, stdSig)
+				if err == nil {
+					extractedSignatues = append(extractedSignatues, sigV2)
+				}
+			}
+		}
+	}
+	return extractedSignatues
 }
