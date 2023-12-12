@@ -158,7 +158,9 @@ func makeMultiSignCmd() func(cmd *cobra.Command, args []string) (err error) {
 		}
 
 		for _, sig := range extractedSignatues {
-			multisig.AddSignatureV2(multisigSig, sig, multisigPub.GetPubKeys())
+			if err := multisig.AddSignatureV2(multisigSig, sig, multisigPub.GetPubKeys()); err != nil {
+				return err
+			}
 		}
 
 		// read each signature and add it to the multisig if valid
